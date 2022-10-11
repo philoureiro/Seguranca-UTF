@@ -1,31 +1,25 @@
 #! /usr/bin/env python
 
+import json
 import socket
 import sys
 import time
 import threading
 import select
 import traceback
+import hashlib
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
+from cryptography.fernet import Fernet
 
-print("Gerando chave privada RSA...")
-private_key = rsa.generate_private_key(
-    public_exponent=65537,
-    key_size=2048,
-    backend=default_backend()
-)
-#Chave privada gerada
-print("Gerando chave publica RSA...")
-public_key = private_key.public_key()
-#Chave publica gerada
-print("Gerando uma chave simétrica utilizando o Fernet...")
-symetricKey = Fernet.generate_key()
-#Chave simétrica gerada
+print("Gerando uma chave simétrica utilizando o módulo Fernet...")
+symetricKey = Fernet.generate_key()#Chave simétrica
+
+ 
 
 
 ############################################################# CLIENT/SERVER ###################################################################################
@@ -46,6 +40,8 @@ class Server(threading.Thread):
                         f = Fernet(symetricKey)
                         decryptedMsg = f.decrypt(chunk)
                         print(decryptedMsg.decode() + '\n>>')
+
+                        
                 except:
                     traceback.print_exc(file=sys.stdout)
                     break
@@ -73,12 +69,24 @@ class Client(threading.Thread):
         s = ''
         self.connect(host, port)
         print("Connected\n")
+
         print("Recebendo chave publica do servidor...")
-        received_serialized_server_key = self.sock.recv(1024)
-        server_public_key = load_pem_public_key(received_serialized_server_key)
-        #Recebeu a chave publica do servidor
+        received_data = self.sock.recv(1024)
+        received_data = received_data.decode()
+        recovered = json.loads(received_data)
+        digestProvider = hashlib.blake2b()
+        digestProvider.update(recovered['server_public_key'].encode())
+        refer_hash = digestProvider.hexdigest()
+        print("Validando integridade da chave pública do servidor")
+        print(refer_hash, recovered['digest'])
+        if(refer_hash != recovered['digest']):
+            raise Exception('Não foi possível validar a integridade da chave pública')
+        print("Desserializando chave pública do servidor")
+        server_public_key = load_pem_public_key(recovered['server_public_key'].encode())# Desserealizou a chave pública
+
+
         print("Criptografando chave simétrica utilizando a chave publica do servidor...")
-        encryptedSymetricKey = server_public_key.encrypt(
+        encryptedSymetricKey = server_public_key.encrypt(# chave simétrica criptografada
             symetricKey,
             padding.OAEP(
             mgf=padding.MGF1(algorithm=hashes.SHA256()),
@@ -86,10 +94,10 @@ class Client(threading.Thread):
             label=None
             )
         )
-        #Criptografou a chave simétrica
-        print("Enviando chave simétrica criptograda para o servidor...")
+        print("Enviando chave simétrica para o servidor...")
         self.send(host, port, encryptedSymetricKey)
-        # print("Enviou a chave publica")
+        
+
         user_name = input("Enter the User Name to be Used\n>>")
         receive = self.sock
         time.sleep(1)
@@ -112,9 +120,16 @@ class Client(threading.Thread):
             # print "Sending\n"
             msg = user_name + ': ' + msg
             f = Fernet(symetricKey)
-            data = msg.encode()
-            encryptedData = f.encrypt(data)
-            self.send(host, port, encryptedData)
+            encodedMsg = msg.encode()
+            encryptedMsg = f.encrypt(encodedMsg)
+            digestProvider = hashlib.blake2b()
+            digestProvider.update(encryptedMsg)
+            digest = digestProvider.hexdigest()
+            encryptedMsg = encryptedMsg.decode()
+            data = {'msg': encryptedMsg, 'digest': digest}
+            dumped = json.dumps(data).encode()
+            self.send(host, port, dumped)
+            
         return (1)
 
 

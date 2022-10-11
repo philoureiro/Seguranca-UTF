@@ -1,10 +1,13 @@
 #! /usr/bin/env python
 
+import setuptools 
+import json
 import socket
 import sys
 import traceback
 import threading
 import select
+import hashlib
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -19,16 +22,16 @@ TO_BE_SENT = []
 SENT_BY = {}
 CONNECTEDS_CLIENTS = []#Armazenará clientes conectados juntamente com chave simétrica que será recebida e descriptografada
 
-print("Gerando chave privada RSA...")
-private_key = rsa.generate_private_key(
+print("Gerando chave privada...")
+private_key = rsa.generate_private_key(#Chave privada 
     public_exponent=65537,
     key_size=2048,
     backend=default_backend()
 )
-#Chave privada gerada
+
 print("Gerando chave publica RSA...")
-public_key = private_key.public_key()
-#Chave publica gerada
+public_key = private_key.public_key()#Chave publica 
+
 
 class Server(threading.Thread):
 
@@ -56,17 +59,27 @@ class Server(threading.Thread):
 
                 else:
                     try:     
-                        received_client_contact = sock.recv(1024)
                         print("Recebendo mensagem")
-                        recovered_client_symetric_key = b''
+                        received_client_contact = sock.recv(1024)
+                        print('desserializando dados')
+                        loaded_contact = json.loads(received_client_contact.decode())
+                        digestProvider = hashlib.blake2b()
+                        digestProvider.update(b'%s'%(loaded_contact['msg'].encode()))
+                        refer_digest = digestProvider.hexdigest()
+                        print('Verificando integridade')
+                        if(loaded_contact['digest'] != refer_digest):
+                            raise Exception('Não foi possível validar a integridade da mensagem')
+                        print("Integridade Validada com sucesso")
+                        recovered_client_symetric_key = b''# Conterá a chave simétrica do cliente que será recuperada de CONNECTEDS_CLIENTS
+                        print("Definindo chave de criptografia para respectivo cliente...")
                         for client in CONNECTEDS_CLIENTS:
                             if sock.getpeername() == client['peer_name']:
                                 recovered_client_symetric_key = client['symetric_key']
-                            
-                        print("Definindo chave de criptografia para respectivos clientes...")
                         f = Fernet(recovered_client_symetric_key)
-                        decryptedMsg = f.decrypt(received_client_contact)
-                        if decryptedMsg == '':
+                        print("Descriptografando mensagem...")
+                        decryptedMsg = f.decrypt((loaded_contact['msg'].encode()))# Mensagem descriptografada
+
+                        if decryptedMsg.decode() == '':
                             print(str(sock.getpeername()))
                             print("Mensagem vazia")
                             continue
@@ -75,42 +88,56 @@ class Server(threading.Thread):
                             TO_BE_SENT.append(decryptedMsg)
                             SENT_BY[decryptedMsg] = (str(sock.getpeername()))
                             
-                        break
+                        
                        
                     except:
                         print(str(sock.getpeername()))
-                        print("Não foi possível recuperar a mensagem")
+                        print("Não foi possível recuperar a mensagem, fechando socket...")
+                        SOCKET_LIST.remove(sockfd)
+                        break
                         
     def clientRegistry(self, sockfd, addr):
         read, write, err = select.select(SOCKET_LIST, [], [], 0)
-        print("Serializando chave publica...")
+
+        print("Serializando dados para envio da chave publica...")
+
         PEM_serialized_public_key = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
+             encoding=serialization.Encoding.PEM,
+             format=serialization.PublicFormat.SubjectPublicKeyInfo
+         )
+        digestProvider = hashlib.blake2b()
+        digestProvider.update(PEM_serialized_public_key)
+        digest = digestProvider.hexdigest()
+        data = {'server_public_key': PEM_serialized_public_key.decode(), 'digest': digest}
+        dumped = json.dumps(data).encode()
         print("enviando chave publica para o cliente...")
         for item in SOCKET_LIST:
             if item == sockfd:
-                item.send(PEM_serialized_public_key)
+                item.send(dumped)
+
         print("Recebendo chave simétrica criptografada do cliente")
-        received_symetric_key = sockfd.recv(1024)
-        print("Descriptografando chave simetrica...")
-        decrypted_client_symetric_key = private_key.decrypt(
+        try:
+            received_symetric_key = sockfd.recv(2048)
+            print("Descriptografando chave simetrica...")
+            decrypted_client_symetric_key = private_key.decrypt(
             received_symetric_key,
             padding.OAEP(
                 mgf=padding.MGF1(algorithm=hashes.SHA256()),
                 algorithm=hashes.SHA256(),
                 label=None
             )
-        )
-        print("Armazenando chave simetrica do cliente")
-        CONNECTEDS_CLIENTS.append(
-                {
-                "peer_name": sockfd.getpeername(),
-                "addr": addr,
-                "symetric_key": decrypted_client_symetric_key
-                }
             )
+            print("Armazenando chave simetrica do cliente")
+            CONNECTEDS_CLIENTS.append(
+                    {
+                    "peer_name": sockfd.getpeername(),
+                    "addr": addr,
+                    "symetric_key": decrypted_client_symetric_key
+                    }
+                )
+        except:
+            print('Não foi possível receber a chave simétrica')
+
 
 
 class handle_connections(threading.Thread):
@@ -121,7 +148,7 @@ class handle_connections(threading.Thread):
                 for s in write:
                     try:
                         if (str(s.getpeername()) == SENT_BY[items]):
-                            print("Impedindo o envio da mensagem para o próprio remetente que há enviou %s" % (str(s.getpeername())))
+                            print("Impedindo a transmissão da mensagem para o próprio remetente que a enviou %s" % (str(s.getpeername())))
                             continue
                         
                        # Criptografar mensagens correspondentemente com a chave simétrica de cada cliente.
@@ -130,9 +157,7 @@ class handle_connections(threading.Thread):
                             if item['addr'] == s.getpeername():
                                 client_symetric_key = item['symetric_key']
                                 f = Fernet(client_symetric_key)
-                                encrypted_msg_with_client_symetric_key = f.encrypt(items)
-                                
-                        #print("encrypted msg", encrypted_msg_with_client_symetric_key)
+                                encrypted_msg_with_client_symetric_key = f.encrypt(items) # Mensagem criptografada
                         print("Enviando mensagem criptografada simetricamente com chave respectiva")
                         print("Sending to %s" % (str(s.getpeername())))
                         s.send(encrypted_msg_with_client_symetric_key)
